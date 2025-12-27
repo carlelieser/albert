@@ -1,5 +1,5 @@
 import { Layer, Effect, ManagedRuntime } from 'effect';
-import type { Ollama } from 'ollama';
+import type { Ollama, ToolCall } from 'ollama';
 import { vi } from 'vitest';
 import { Brain } from '../../src/core/brain';
 import { ExecutiveModule } from '../../src/core/modules/executive';
@@ -23,11 +23,13 @@ import {
     type MockKnowledgeState,
     type MockPersonalityState,
 } from './mock-repositories';
+import { ToolRegistry } from '../../src/infrastructure/services/tool-registry';
+import type { ITool, IToolRegistry } from '../../src/domain/services/tool-registry';
 
 export interface MockOllamaConfig {
     defaultResponse?: string;
     streamingResponse?: string;
-    toolResponses?: Record<string, unknown>;
+    toolCalls?: ToolCall[];
     factExtractionResponse?: { facts: Array<{ content: string; confidence: number }>; deleteIds: string[] };
 }
 
@@ -35,6 +37,8 @@ export function createConfigurableMockOllama(config: MockOllamaConfig = {}): Oll
     const defaultResponse = config.defaultResponse ?? 'Hello! How can I help you today?';
     const streamingResponse = config.streamingResponse ?? defaultResponse;
     const factResponse = config.factExtractionResponse ?? { facts: [], deleteIds: [] };
+    const toolCalls = config.toolCalls;
+    let toolCallMade = false;
 
     return {
         chat: vi.fn().mockImplementation((options) => {
@@ -50,9 +54,10 @@ export function createConfigurableMockOllama(config: MockOllamaConfig = {}): Oll
                     message: { content: JSON.stringify(factResponse) },
                 });
             }
-            if (options.tools && options.tools.length > 0) {
+            if (options.tools && options.tools.length > 0 && toolCalls && !toolCallMade) {
+                toolCallMade = true;
                 return Promise.resolve({
-                    message: { content: defaultResponse, tool_calls: [] },
+                    message: { content: '', tool_calls: toolCalls },
                 });
             }
             return Promise.resolve({
@@ -80,11 +85,13 @@ export interface IntegrationHarness {
     capture: EventCapture;
     mockOllama: Ollama;
     mockStates: MockStates;
+    toolRegistry: IToolRegistry;
     cleanup: () => Promise<void>;
 }
 
 export interface HarnessConfig {
     ollamaConfig?: MockOllamaConfig;
+    tools?: ITool[];
 }
 
 export async function createIntegrationHarness(config: HarnessConfig = {}): Promise<IntegrationHarness> {
@@ -98,6 +105,13 @@ export async function createIntegrationHarness(config: HarnessConfig = {}): Prom
     const memoryRepo = createMockMemoryRepository(memoryState);
     const knowledgeRepo = createMockKnowledgeRepository(knowledgeState);
     const personalityRepo = createMockPersonalityRepository(personalityState);
+
+    const toolRegistry = new ToolRegistry();
+    if (config.tools) {
+        for (const tool of config.tools) {
+            Effect.runSync(toolRegistry.register(tool));
+        }
+    }
 
     const mockPrisma = {} as any;
 
@@ -131,7 +145,7 @@ export async function createIntegrationHarness(config: HarnessConfig = {}): Prom
     const memoryModule = new MemoryModule(memoryRepo);
     const knowledgeModule = new KnowledgeModule(knowledgeRepo);
     const personalityModule = new PersonalityModule(personalityRepo);
-    const executiveModule = new ExecutiveModule();
+    const executiveModule = new ExecutiveModule(undefined, toolRegistry);
 
     brain.registerModule(memoryModule);
     brain.registerModule(knowledgeModule);
@@ -153,6 +167,7 @@ export async function createIntegrationHarness(config: HarnessConfig = {}): Prom
         output,
         capture,
         mockOllama,
+        toolRegistry,
         mockStates: {
             memory: memoryState,
             knowledge: knowledgeState,
