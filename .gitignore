@@ -3,6 +3,7 @@ node_modules/
 
 # Build output
 dist/
+bin/
 
 # Test coverage
 coverage/
@@ -29,6 +30,14 @@ npm-debug.log*
 # Runtime data
 *.pid
 *.seed
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+
+# Backups
+*.zip
 
 # Albert data (user-specific)
 .albert/
