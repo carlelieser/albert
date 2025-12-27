@@ -1,8 +1,18 @@
-import type { Ollama, Message } from 'ollama';
+import { Effect, Stream } from 'effect';
+import type { Message, Tool as OllamaTool } from 'ollama';
 import { BaseModule } from './base';
 import type { BrainEvent } from '../brain';
 import { Events } from '../events';
-import type { MemoryEntry } from './memory';
+import type { MemoryEntry } from '../../domain/entities/memory';
+import type { IToolRegistry } from '../../domain/services/tool-registry';
+import type { IToolExecutor } from '../../domain/services/tool-executor';
+import { ToolExecutor } from '../../infrastructure/services/tool-executor';
+import { toOllamaTool } from '../../domain/entities/tool';
+import { config, type ModelsConfig } from '../../config';
+import { ollamaChat, ollamaChatStream } from '../../infrastructure/services/ollama.effect';
+import { summarizeIfNeeded } from '../../infrastructure/services/content-summarizer';
+import type { LLMStreamError } from '../../domain/errors';
+import type { AppServices } from '../../infrastructure/layers';
 
 interface InputReceivedPayload {
     text: string;
@@ -41,32 +51,38 @@ interface PendingRequest {
 
 export class ExecutiveModule extends BaseModule {
     private readonly pendingRequests = new Map<string, PendingRequest>();
-    private readonly model: string;
+    private readonly models: ModelsConfig;
+    private readonly toolRegistry: IToolRegistry | null;
+    private readonly toolExecutor: IToolExecutor;
+    private readonly maxToolIterations: number;
 
-    constructor(ollama: Ollama, model: string = 'llama3.1:8b') {
-        super(ollama, 'executive');
-        this.model = model;
+    constructor(
+        models: ModelsConfig = config.ollama.models,
+        toolRegistry: IToolRegistry | null = null,
+        maxToolIterations: number = 10
+    ) {
+        super('executive');
+        this.models = models;
+        this.toolRegistry = toolRegistry;
+        this.toolExecutor = new ToolExecutor(toolRegistry);
+        this.maxToolIterations = maxToolIterations;
     }
 
     registerListeners(): void {
         if (!this.brain) return;
 
-        // Listen for user input
         this.brain.on(Events.InputReceived, (event: BrainEvent) => {
             this.handleInput(event);
         });
 
-        // Listen for memory results
         this.brain.on(Events.MemoryResult, (event: BrainEvent) => {
             this.handleMemoryResult(event);
         });
 
-        // Listen for personality results
         this.brain.on(Events.PersonalityResult, (event: BrainEvent) => {
             this.handlePersonalityResult(event);
         });
 
-        // Listen for knowledge results
         this.brain.on(Events.KnowledgeResult, (event: BrainEvent) => {
             this.handleKnowledgeResult(event);
         });
@@ -80,12 +96,10 @@ export class ExecutiveModule extends BaseModule {
         const payload = event.data as InputReceivedPayload;
         const inputText = payload.text;
 
-        // Generate unique request IDs
         const memoryRequestId = this.generateRequestId();
         const personalityRequestId = this.generateRequestId();
         const knowledgeRequestId = this.generateRequestId();
 
-        // Store pending request
         const requestKey = `${memoryRequestId}:${personalityRequestId}:${knowledgeRequestId}`;
         this.pendingRequests.set(requestKey, {
             inputText,
@@ -94,113 +108,109 @@ export class ExecutiveModule extends BaseModule {
             knowledgeRequestId,
         });
 
-        // Query memory for conversation context
         this.brain!.emit(Events.MemoryQuery, {
             count: 10,
             requestId: memoryRequestId,
         });
 
-        // Query personality for system prompt
         this.brain!.emit(Events.PersonalityQuery, {
             requestId: personalityRequestId,
         });
 
-        // Query knowledge for relevant facts
         this.brain!.emit(Events.KnowledgeQuery, {
             query: inputText,
             requestId: knowledgeRequestId,
         });
     }
 
-    private handleMemoryResult(event: BrainEvent): void {
-        const payload = event.data as MemoryResultPayload;
-        const requestId = payload.requestId;
-
-        // Find the pending request
+    private handleResultEvent<T extends { requestId: string }>(
+        event: BrainEvent,
+        getRequestId: (request: PendingRequest) => string,
+        updateRequest: (request: PendingRequest, payload: T) => void
+    ): void {
+        const payload = event.data as T;
         for (const [key, request] of this.pendingRequests.entries()) {
-            if (request.memoryRequestId === requestId) {
-                request.memoryEntries = payload.entries;
-                void this.tryProcessRequest(key);
+            if (getRequestId(request) === payload.requestId) {
+                updateRequest(request, payload);
+                this.tryProcessRequest(key);
                 break;
             }
         }
+    }
+
+    private handleMemoryResult(event: BrainEvent): void {
+        this.handleResultEvent<MemoryResultPayload>(
+            event,
+            (r) => r.memoryRequestId,
+            (r, p) => { r.memoryEntries = p.entries; }
+        );
     }
 
     private handlePersonalityResult(event: BrainEvent): void {
-        const payload = event.data as PersonalityResultPayload;
-        const requestId = payload.requestId;
-
-        // Find the pending request
-        for (const [key, request] of this.pendingRequests.entries()) {
-            if (request.personalityRequestId === requestId) {
-                request.systemPrompt = payload.systemPrompt;
-                void this.tryProcessRequest(key);
-                break;
-            }
-        }
+        this.handleResultEvent<PersonalityResultPayload>(
+            event,
+            (r) => r.personalityRequestId,
+            (r, p) => { r.systemPrompt = p.systemPrompt; }
+        );
     }
 
     private handleKnowledgeResult(event: BrainEvent): void {
-        const payload = event.data as KnowledgeResultPayload;
-        const requestId = payload.requestId;
-
-        // Find the pending request
-        for (const [key, request] of this.pendingRequests.entries()) {
-            if (request.knowledgeRequestId === requestId) {
-                request.knowledgeFacts = payload.facts;
-                void this.tryProcessRequest(key);
-                break;
-            }
-        }
+        this.handleResultEvent<KnowledgeResultPayload>(
+            event,
+            (r) => r.knowledgeRequestId,
+            (r, p) => { r.knowledgeFacts = p.facts; }
+        );
     }
 
-    private async tryProcessRequest(requestKey: string): Promise<void> {
+    private tryProcessRequest(requestKey: string): void {
         const request = this.pendingRequests.get(requestKey);
         if (!request) return;
 
-        // Check if we have all required data
         if (
             request.memoryEntries === undefined ||
             request.systemPrompt === undefined ||
             request.knowledgeFacts === undefined
         ) {
-            return; // Still waiting for responses
+            return;
         }
 
-        // Remove from pending
         this.pendingRequests.delete(requestKey);
 
-        // Process the request
-        await this.processInput(
-            request.inputText,
-            request.memoryEntries,
-            request.systemPrompt,
-            request.knowledgeFacts
+        this.forkEffect(
+            this.processInputEffect(
+                request.inputText,
+                request.memoryEntries,
+                request.systemPrompt,
+                request.knowledgeFacts
+            )
         );
     }
 
-    private async processInput(
+    private processInputEffect(
         inputText: string,
         memoryEntries: MemoryEntry[],
         systemPrompt: string,
         knowledgeFacts: KnowledgeFact[]
-    ): Promise<void> {
-        try {
-            // Build enhanced system prompt with knowledge
+    ): Effect.Effect<void, never, AppServices> {
+        return Effect.gen(this, function* () {
             let enhancedSystemPrompt = systemPrompt;
             if (knowledgeFacts.length > 0) {
                 const factsSection = knowledgeFacts
-                    .map(f => `- ${f.fact}`)
+                    .map((f) => `- ${f.fact}`)
                     .join('\n');
-                enhancedSystemPrompt += `\n\nRelevant facts you know about the user:\n${factsSection}`;
+                enhancedSystemPrompt += `\n\nContext:\n${factsSection}`;
             }
 
-            // Build messages for Ollama
+            if (this.toolRegistry && this.toolRegistry.getAll().length > 0) {
+                const toolNames = this.toolRegistry.getDefinitions().map(t => t.name).join(', ');
+                enhancedSystemPrompt +=
+                    `\n\nYou have access to tools: ${toolNames}. These tools give you capabilities beyond your base knowledge—use them to fetch real-time data, search the web, or perform actions when the user's request requires current information.`;
+            }
+
             const messages: Message[] = [
                 { role: 'system', content: enhancedSystemPrompt },
             ];
 
-            // Add conversation history
             for (const entry of memoryEntries) {
                 messages.push({
                     role: entry.role,
@@ -208,87 +218,161 @@ export class ExecutiveModule extends BaseModule {
                 });
             }
 
-            // Add current user input
             messages.push({
                 role: 'user',
                 content: inputText,
             });
 
-            // Store user message in memory
             this.brain!.emit(Events.MemoryStore, {
                 role: 'user',
                 content: inputText,
             });
 
-            // Call Ollama
-            const response = await this.ollama.chat({
-                model: this.model,
-                messages,
-                stream: false,
-            });
+            const tools: OllamaTool[] | undefined = this.toolRegistry
+                ? this.toolRegistry.getDefinitions().map(toOllamaTool)
+                : undefined;
 
-            const responseText = response.message.content;
+            const expertMessages = [...messages];
+            let iteration = 0;
+            while (iteration < this.maxToolIterations) {
+                const response = yield* ollamaChat({
+                    model: this.models.expert,
+                    messages: expertMessages,
+                    tools,
+                });
 
-            // Store assistant response in memory
-            this.brain!.emit(Events.MemoryStore, {
-                role: 'assistant',
-                content: responseText,
-            });
-
-            // Emit output
-            this.brain!.emit(Events.OutputReady, {
-                text: responseText,
-            });
-
-            // Extract and store any personal facts from user input
-            void this.extractAndStoreFacts(inputText);
-        } catch (error) {
-            // Emit error output
-            this.brain!.emit(Events.OutputReady, {
-                text: `I encountered an error: ${error instanceof Error ? error.message : 'Unknown error'}`,
-                error: true,
-            });
-        }
-    }
-
-    private async extractAndStoreFacts(userInput: string): Promise<void> {
-        try {
-            const response = await this.ollama.chat({
-                model: this.model,
-                messages: [
-                    {
-                        role: 'system',
-                        content: 'Extract any personal facts about the user from their message (name, preferences, occupation, location, etc.). Each fact should be a complete sentence.',
-                    },
-                    { role: 'user', content: userInput },
-                ],
-                stream: false,
-                format: {
-                    type: 'object',
-                    properties: {
-                        facts: {
-                            type: 'array',
-                            items: { type: 'string' },
-                            description: 'List of personal facts extracted from the message, or empty if none found',
-                        },
-                    },
-                    required: ['facts'],
-                },
-            });
-
-            const parsed = JSON.parse(response.message.content) as { facts: string[] };
-            for (const fact of parsed.facts) {
-                if (fact && fact.length > 0) {
-                    this.brain!.emit(Events.KnowledgeStore, {
-                        fact,
-                        source: 'user',
-                        confidence: 0.9,
+                const thinking = (response.message as { thinking?: string }).thinking;
+                if (thinking) {
+                    this.brain!.emit(Events.ThinkingReady, {
+                        thinking,
+                        model: this.models.expert,
                     });
                 }
+
+                if (response.message.tool_calls && response.message.tool_calls.length > 0) {
+                    expertMessages.push(response.message);
+
+                    const toolResults = yield* this.toolExecutor.executeAll(
+                        response.message.tool_calls,
+                        {
+                            onStart: (correlationId, toolName, args) =>
+                                this.brain!.emit(Events.ToolExecutionStart, { correlationId, toolName, arguments: args }),
+                            onComplete: (correlationId, result) =>
+                                this.brain!.emit(Events.ToolExecutionComplete, { correlationId, ...result }),
+                            onError: (correlationId, result) =>
+                                this.brain!.emit(Events.ToolExecutionError, { correlationId, ...result }),
+                        }
+                    );
+
+                    for (const result of toolResults) {
+                        const rawContent = result.success ? result.output : `Error: ${result.error}`;
+                        const content = yield* summarizeIfNeeded(rawContent, inputText);
+                        expertMessages.push({
+                            role: 'tool',
+                            content,
+                            tool_name: result.toolName,
+                        });
+                    }
+
+                    iteration++;
+                    continue;
+                }
+
+                let summary = response.message.content;
+
+                if (iteration > 0) {
+                    expertMessages.push(response.message);
+                    expertMessages.push({
+                        role: 'system',
+                        content: 'Summarize what you learned from the tools to help answer the original question.',
+                    });
+
+                    const summaryResponse = yield* ollamaChat({
+                        model: this.models.expert,
+                        messages: expertMessages,
+                    });
+
+                    const summaryThinking = (summaryResponse.message as { thinking?: string }).thinking;
+                    if (summaryThinking) {
+                        this.brain!.emit(Events.ThinkingReady, {
+                            thinking: summaryThinking,
+                            model: this.models.expert,
+                        });
+                    }
+
+                    summary = summaryResponse.message.content;
+                }
+
+                const systemMessage = messages[0];
+                if (systemMessage && systemMessage.role === 'system') {
+                    systemMessage.content += `\n\nUse this analysis to inform your response:\n${summary}`;
+                }
+
+                yield* this.streamFinalResponseEffect(messages);
+                break;
             }
-        } catch {
-            // Silently fail - fact extraction is non-critical
-        }
+
+            if (iteration >= this.maxToolIterations) {
+                this.brain!.emit(Events.OutputReady, {
+                    text: 'I reached the maximum number of tool iterations. Please try a simpler request.',
+                    error: true,
+                });
+            }
+        }).pipe(
+            Effect.catchAll((error: unknown) => {
+                let errorMessage = 'Unknown error';
+                if (error && typeof error === 'object') {
+                    if ('message' in error && typeof error.message === 'string') {
+                        errorMessage = error.message;
+                    } else if ('_tag' in error) {
+                        errorMessage = `${String(error._tag)}: ${JSON.stringify(error)}`;
+                    }
+                }
+                console.error('Executive module error:', error);
+                this.brain!.emit(Events.OutputReady, {
+                    text: `I encountered an error: ${errorMessage}`,
+                    error: true,
+                });
+                return Effect.void;
+            })
+        );
+    }
+
+    private streamFinalResponseEffect(
+        messages: Message[]
+    ): Effect.Effect<void, LLMStreamError, AppServices> {
+        let responseText = '';
+
+        const stream = ollamaChatStream({
+            model: this.models.main,
+            messages,
+        }).pipe(
+            Stream.tap((chunk) =>
+                Effect.sync(() => {
+                    responseText += chunk.content;
+                    this.brain!.emit(Events.OutputChunk, {
+                        text: chunk.content,
+                        done: chunk.done,
+                    });
+                })
+            )
+        );
+
+        return stream.pipe(
+            Stream.runDrain,
+            Effect.tap(() =>
+                Effect.sync(() => {
+                    this.brain!.emit(Events.MemoryStore, {
+                        role: 'assistant',
+                        content: responseText,
+                    });
+
+                    this.brain!.emit(Events.OutputReady, {
+                        text: responseText,
+                    });
+                })
+            )
+        );
     }
 
     async shutdown(): Promise<void> {

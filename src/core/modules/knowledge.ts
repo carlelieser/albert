@@ -1,18 +1,13 @@
-import Database from 'better-sqlite3';
-import type { Database as DatabaseType } from 'better-sqlite3';
-import type { Ollama } from 'ollama';
+import { Effect } from 'effect';
 import { BaseModule } from './base';
-import type { Brain, BrainEvent } from '../brain';
+import type { BrainEvent } from '../brain';
 import { Events } from '../events';
-
-export interface KnowledgeFact {
-    id: number;
-    fact: string;
-    source: string | null;
-    confidence: number;
-    createdAt: number;
-    updatedAt: number;
-}
+import type { IKnowledgeRepository } from '../../domain/repositories/knowledge.repository';
+import type { KnowledgeFact, SemanticSearchResult } from '../../domain/entities/knowledge';
+import type { PrismaService } from '../../infrastructure/database/prisma.effect';
+import { ollamaEmbed, ollamaChat } from '../../infrastructure/services/ollama.effect';
+import type { AppServices } from '../../infrastructure/layers';
+import { config } from '../../config';
 
 interface KnowledgeStorePayload {
     fact: string;
@@ -26,13 +21,13 @@ interface KnowledgeQueryPayload {
     limit?: number;
 }
 
-export class KnowledgeModule extends BaseModule {
-    private db: DatabaseType | null = null;
-    private readonly dbPath: string;
+const EMBEDDING_MODEL = 'nomic-embed-text';
 
-    constructor(ollama: Ollama, dbPath: string = './albert.db') {
-        super(ollama, 'knowledge');
-        this.dbPath = dbPath;
+export class KnowledgeModule extends BaseModule {
+    constructor(
+        private readonly repository: IKnowledgeRepository<PrismaService>
+    ) {
+        super('knowledge');
     }
 
     registerListeners(): void {
@@ -40,144 +35,258 @@ export class KnowledgeModule extends BaseModule {
 
         this.brain.on(Events.KnowledgeStore, (event: BrainEvent) => {
             const payload = event.data as KnowledgeStorePayload;
-            this.storeFact(payload.fact, payload.source ?? 'unknown', payload.confidence ?? 1.0);
+            this.forkEffect(this.handleStoreEffect(payload));
         });
 
         this.brain.on(Events.KnowledgeQuery, (event: BrainEvent) => {
             const payload = event.data as KnowledgeQueryPayload;
-            const facts = this.search(payload.query, payload.limit);
+            this.forkEffect(this.handleQueryEffect(payload));
+        });
 
-            this.brain!.emit(Events.KnowledgeResult, {
-                requestId: payload.requestId,
-                facts,
-            });
+        this.brain.on(Events.InputReceived, (event: BrainEvent) => {
+            const payload = event.data as { text: string };
+            this.forkEffect(this.handleDismissalsEffect(payload.text));
+            this.forkEffect(this.extractFactsEffect(payload.text));
         });
     }
 
-    init(brain: Brain): void {
-        super.init(brain);
-        this.db = new Database(this.dbPath);
-        this.db.pragma('journal_mode = WAL');
-        this.createTables();
-    }
-
-    private createTables(): void {
-        if (!this.db) return;
-
-        this.db.exec(`
-            CREATE TABLE IF NOT EXISTS knowledge (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                fact TEXT NOT NULL UNIQUE,
-                source TEXT,
-                confidence REAL DEFAULT 1.0,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
+    private handleStoreEffect(
+        payload: KnowledgeStorePayload
+    ): Effect.Effect<void, never, AppServices> {
+        return Effect.gen(this, function* () {
+            const embedding = yield* ollamaEmbed(EMBEDDING_MODEL, payload.fact);
+            yield* this.repository.storeFactWithEmbedding(
+                payload.fact,
+                embedding,
+                payload.source ?? 'unknown',
+                payload.confidence ?? 1.0
             );
+        }).pipe(
+            Effect.catchAll(() => Effect.void)
+        );
+    }
 
-            CREATE TABLE IF NOT EXISTS categories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE
+    private handleQueryEffect(
+        payload: KnowledgeQueryPayload
+    ): Effect.Effect<void, never, AppServices> {
+        return Effect.gen(this, function* () {
+            const embedding = yield* ollamaEmbed(EMBEDDING_MODEL, payload.query);
+            return yield* this.repository.searchByEmbedding(
+                embedding,
+                payload.limit ?? 10
             );
+        }).pipe(
+            Effect.tap((facts) =>
+                Effect.sync(() =>
+                    this.brain!.emit(Events.KnowledgeResult, {
+                        requestId: payload.requestId,
+                        facts,
+                    })
+                )
+            ),
+            Effect.catchAll(() =>
+                Effect.sync(() =>
+                    this.brain!.emit(Events.KnowledgeResult, {
+                        requestId: payload.requestId,
+                        facts: [],
+                    })
+                )
+            ),
+            Effect.asVoid
+        );
+    }
 
-            CREATE TABLE IF NOT EXISTS knowledge_categories (
-                knowledge_id INTEGER REFERENCES knowledge(id) ON DELETE CASCADE,
-                category_id INTEGER REFERENCES categories(id) ON DELETE CASCADE,
-                PRIMARY KEY (knowledge_id, category_id)
+    private handleDismissalsEffect(
+        input: string
+    ): Effect.Effect<void, never, AppServices> {
+        return Effect.gen(this, function* () {
+            const facts = yield* this.repository.getAllFacts();
+            if (facts.length === 0) return;
+
+            const factsWithIds = facts.map((f) => ({ id: f.id, fact: f.fact }));
+
+            const response = yield* ollamaChat({
+                model: config.ollama.models.helper,
+                messages: [
+                    {
+                        role: 'system',
+                        content:
+                            'You analyze user messages to determine if any stored facts should be deleted. Return the IDs of facts to delete, or an empty array if none.',
+                    },
+                    {
+                        role: 'user',
+                        content: `User message: "${input}"\n\nStored facts:\n${JSON.stringify(factsWithIds, null, 2)}`,
+                    },
+                ],
+                format: {
+                    type: 'object',
+                    properties: {
+                        deleteIds: {
+                            type: 'array',
+                            items: { type: 'number' },
+                            description: 'IDs of facts to delete based on user dismissal or correction',
+                        },
+                    },
+                    required: ['deleteIds'],
+                },
+            });
+
+            const parsed = JSON.parse(response.message.content) as { deleteIds: number[] };
+            yield* Effect.forEach(
+                parsed.deleteIds,
+                (id) => this.repository.deleteFact(id).pipe(Effect.catchAll(() => Effect.void)),
+                { discard: true }
             );
-        `);
-
-        // Create FTS table if it doesn't exist
-        try {
-            this.db.exec(`
-                CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts
-                USING fts5(fact, content=knowledge, content_rowid=id);
-            `);
-        } catch {
-            // FTS table might already exist
-        }
-
-        // Create triggers for FTS sync
-        this.db.exec(`
-            CREATE TRIGGER IF NOT EXISTS knowledge_ai AFTER INSERT ON knowledge BEGIN
-                INSERT INTO knowledge_fts(rowid, fact) VALUES (new.id, new.fact);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS knowledge_ad AFTER DELETE ON knowledge BEGIN
-                INSERT INTO knowledge_fts(knowledge_fts, rowid, fact)
-                VALUES('delete', old.id, old.fact);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS knowledge_au AFTER UPDATE ON knowledge BEGIN
-                INSERT INTO knowledge_fts(knowledge_fts, rowid, fact)
-                VALUES('delete', old.id, old.fact);
-                INSERT INTO knowledge_fts(rowid, fact) VALUES (new.id, new.fact);
-            END;
-        `);
+        }).pipe(
+            Effect.catchAll(() => Effect.void)
+        );
     }
 
-    storeFact(fact: string, source: string | null = null, confidence: number = 1.0): number {
-        if (!this.db) throw new Error('Database not initialized');
+    private extractFactsEffect(
+        userInput: string
+    ): Effect.Effect<void, never, AppServices> {
+        return Effect.gen(this, function* () {
+            const response = yield* ollamaChat({
+                model: config.ollama.models.helper,
+                messages: [
+                    {
+                        role: 'system',
+                        content: 'Extract any personal facts about the user from their message (name, preferences, occupation, location, etc.). Each fact should be a complete sentence.',
+                    },
+                    { role: 'user', content: userInput },
+                ],
+                format: {
+                    type: 'object',
+                    properties: {
+                        facts: {
+                            type: 'array',
+                            items: { type: 'string' },
+                            description: 'List of personal facts extracted from the message, or empty if none found',
+                        },
+                    },
+                    required: ['facts'],
+                },
+            });
 
-        const now = Date.now();
-        const stmt = this.db.prepare(`
-            INSERT INTO knowledge (fact, source, confidence, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(fact) DO UPDATE SET
-                confidence = excluded.confidence,
-                updated_at = excluded.updated_at
-        `);
-
-        const result = stmt.run(fact, source, confidence, now, now);
-        return result.lastInsertRowid as number;
+            const parsed = JSON.parse(response.message.content) as { facts: string[] };
+            yield* Effect.forEach(
+                parsed.facts.filter((fact) => fact && fact.length > 0),
+                (fact) =>
+                    Effect.sync(() =>
+                        this.brain!.emit(Events.KnowledgeStore, {
+                            fact,
+                            source: 'user',
+                            confidence: 0.9,
+                        })
+                    ),
+                { discard: true }
+            );
+        }).pipe(
+            Effect.catchAll(() => Effect.void)
+        );
     }
 
-    search(query: string, limit: number = 10): KnowledgeFact[] {
-        if (!this.db) return [];
-
-        try {
-            const stmt = this.db.prepare(`
-                SELECT k.id, k.fact, k.source, k.confidence,
-                       k.created_at as createdAt, k.updated_at as updatedAt
-                FROM knowledge_fts
-                JOIN knowledge k ON knowledge_fts.rowid = k.id
-                WHERE knowledge_fts MATCH ?
-                ORDER BY rank
-                LIMIT ?
-            `);
-
-            return stmt.all(query, limit) as KnowledgeFact[];
-        } catch {
-            // Fallback to LIKE search if FTS fails
-            const stmt = this.db.prepare(`
-                SELECT id, fact, source, confidence,
-                       created_at as createdAt, updated_at as updatedAt
-                FROM knowledge
-                WHERE fact LIKE ?
-                ORDER BY updated_at DESC
-                LIMIT ?
-            `);
-
-            return stmt.all(`%${query}%`, limit) as KnowledgeFact[];
-        }
+    storeFactEffect(
+        fact: string,
+        source: string | null = null,
+        confidence: number = 1.0
+    ): Effect.Effect<number, never, AppServices> {
+        return this.repository.storeFact(fact, source ?? undefined, confidence).pipe(
+            Effect.catchAll(() => Effect.succeed(-1))
+        );
     }
 
-    getAllFacts(): KnowledgeFact[] {
-        if (!this.db) throw new Error('Database not initialized');
+    async storeFact(
+        fact: string,
+        source: string | null = null,
+        confidence: number = 1.0
+    ): Promise<number> {
+        return await this.runEffect(this.storeFactEffect(fact, source, confidence));
+    }
 
-        const stmt = this.db.prepare(`
-            SELECT id, fact, source, confidence,
-                   created_at as createdAt, updated_at as updatedAt
-            FROM knowledge
-            ORDER BY updated_at DESC
-        `);
+    storeFactWithEmbeddingEffect(
+        fact: string,
+        source: string | null = null,
+        confidence: number = 1.0
+    ): Effect.Effect<number, never, AppServices> {
+        return Effect.gen(this, function* () {
+            const embedding = yield* ollamaEmbed(EMBEDDING_MODEL, fact);
+            return yield* this.repository.storeFactWithEmbedding(
+                fact,
+                embedding,
+                source ?? undefined,
+                confidence
+            );
+        }).pipe(
+            Effect.catchAll(() => Effect.succeed(-1))
+        );
+    }
 
-        return stmt.all() as KnowledgeFact[];
+    async storeFactWithEmbedding(
+        fact: string,
+        source: string | null = null,
+        confidence: number = 1.0
+    ): Promise<number> {
+        return await this.runEffect(this.storeFactWithEmbeddingEffect(fact, source, confidence));
+    }
+
+    semanticSearchEffect(
+        query: string,
+        limit: number = 10
+    ): Effect.Effect<SemanticSearchResult[], never, AppServices> {
+        return Effect.gen(this, function* () {
+            const embedding = yield* ollamaEmbed(EMBEDDING_MODEL, query);
+            return yield* this.repository.searchByEmbedding(embedding, limit);
+        }).pipe(
+            Effect.catchAll(() => Effect.succeed([]))
+        );
+    }
+
+    async semanticSearch(
+        query: string,
+        limit: number = 10
+    ): Promise<SemanticSearchResult[]> {
+        return await this.runEffect(this.semanticSearchEffect(query, limit));
+    }
+
+    getAllFactsEffect(
+        includeEmbeddings = false
+    ): Effect.Effect<KnowledgeFact[], never, AppServices> {
+        return this.repository.getAllFacts(includeEmbeddings).pipe(
+            Effect.catchAll(() => Effect.succeed([]))
+        );
+    }
+
+    async getAllFacts(includeEmbeddings = false): Promise<KnowledgeFact[]> {
+        return await this.runEffect(this.getAllFactsEffect(includeEmbeddings));
+    }
+
+    getFactEffect(id: number): Effect.Effect<KnowledgeFact | null, never, AppServices> {
+        return this.repository.getFact(id).pipe(
+            Effect.catchTag('FactNotFoundError', () => Effect.succeed(null)),
+            Effect.catchAll(() => Effect.succeed(null))
+        );
+    }
+
+    async getFact(id: number): Promise<KnowledgeFact | null> {
+        return await this.runEffect(this.getFactEffect(id));
+    }
+
+    deleteFactEffect(id: number): Effect.Effect<boolean, never, AppServices> {
+        return this.repository.deleteFact(id).pipe(
+            Effect.map(() => true),
+            Effect.catchTag('FactNotFoundError', () => Effect.succeed(false)),
+            Effect.catchAll(() => Effect.succeed(false))
+        );
+    }
+
+    async deleteFact(id: number): Promise<boolean> {
+        return await this.runEffect(this.deleteFactEffect(id));
     }
 
     async shutdown(): Promise<void> {
-        if (this.db) {
-            this.db.close();
-            this.db = null;
-        }
+        // No cleanup needed
     }
 }
+
+export type { KnowledgeFact, SemanticSearchResult };

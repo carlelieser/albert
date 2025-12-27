@@ -2,7 +2,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { ExecutiveModule } from '../../../src/core/modules/executive';
 import { Brain } from '../../../src/core/brain';
 import { Events } from '../../../src/core/events';
+import { config } from '../../../src/config';
 import type { Ollama } from 'ollama';
+import { createTestRuntime } from '../../helpers/test-runtime';
 
 describe('ExecutiveModule', () => {
     let module: ExecutiveModule;
@@ -11,12 +13,27 @@ describe('ExecutiveModule', () => {
 
     beforeEach(() => {
         mockOllama = {
-            chat: vi.fn().mockResolvedValue({
-                message: { content: 'Hello! How can I help you today?' },
+            chat: vi.fn().mockImplementation((options) => {
+                if (options.stream) {
+                    return Promise.resolve({
+                        async *[Symbol.asyncIterator]() {
+                            yield { message: { content: 'Hello! How can I help you today?' }, done: true };
+                        },
+                    });
+                }
+                if (options.format) {
+                    return Promise.resolve({
+                        message: { content: '{"facts": []}' },
+                    });
+                }
+                return Promise.resolve({
+                    message: { content: 'Hello! How can I help you today?' },
+                });
             }),
         } as unknown as Ollama;
         brain = new Brain();
-        module = new ExecutiveModule(mockOllama);
+        brain.setRuntime(createTestRuntime(mockOllama));
+        module = new ExecutiveModule();
     });
 
     describe('initialization', () => {
@@ -222,7 +239,7 @@ describe('ExecutiveModule', () => {
 
             expect(mockOllama.chat).toHaveBeenCalledWith(
                 expect.objectContaining({
-                    model: 'llama3.1:8b',
+                    model: config.ollama.models.expert,
                     messages: expect.arrayContaining([
                         expect.objectContaining({ role: 'system' }),
                         expect.objectContaining({ role: 'user', content: 'How are you?' }),

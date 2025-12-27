@@ -1,18 +1,11 @@
-import type { Ollama } from 'ollama';
+import { Effect } from 'effect';
 import { BaseModule } from './base';
-import type { BrainEvent } from '../brain';
+import type { Brain, BrainEvent } from '../brain';
 import { Events } from '../events';
-
-export interface PersonalityTraits {
-    formality: number;      // 0 = casual, 1 = formal
-    verbosity: number;      // 0 = terse, 1 = elaborate
-    warmth: number;         // 0 = neutral, 1 = warm/friendly
-    humor: number;          // 0 = serious, 1 = playful
-    confidence: number;     // 0 = hedging, 1 = assertive
-    useEmoji: boolean;
-    preferBulletPoints: boolean;
-    askFollowUpQuestions: boolean;
-}
+import type { IPersonalityRepository } from '../../domain/repositories/personality.repository';
+import type { PersonalityTraits, PersonalityProfile } from '../../domain/entities/personality';
+import type { PrismaService } from '../../infrastructure/database/prisma.effect';
+import type { AppServices } from '../../infrastructure/layers';
 
 interface PersonalityQueryPayload {
     requestId: string;
@@ -23,23 +16,39 @@ interface PersonalityAdjustPayload {
     value: number | boolean;
 }
 
-const DEFAULT_TRAITS: PersonalityTraits = {
-    formality: 0.3,
-    verbosity: 0.4,
-    warmth: 0.7,
-    humor: 0.3,
-    confidence: 0.6,
-    useEmoji: false,
-    preferBulletPoints: false,
-    askFollowUpQuestions: true,
-};
-
 export class PersonalityModule extends BaseModule {
-    private traits: PersonalityTraits;
+    private traits: PersonalityTraits | null = null;
 
-    constructor(ollama: Ollama) {
-        super(ollama, 'personality');
-        this.traits = { ...DEFAULT_TRAITS };
+    constructor(
+        private readonly repository: IPersonalityRepository<PrismaService>
+    ) {
+        super('personality');
+    }
+
+    async init(brain: Brain): Promise<void> {
+        super.init(brain);
+        await this.runEffect(this.loadTraitsEffect());
+    }
+
+    private loadTraitsEffect(): Effect.Effect<void, never, AppServices> {
+        return this.repository.getOrCreateDefault().pipe(
+            Effect.tap((profile) =>
+                Effect.sync(() => {
+                    this.traits = {
+                        formality: profile.formality,
+                        verbosity: profile.verbosity,
+                        warmth: profile.warmth,
+                        humor: profile.humor,
+                        confidence: profile.confidence,
+                        useEmoji: profile.useEmoji,
+                        preferBulletPoints: profile.preferBulletPoints,
+                        askFollowUpQuestions: profile.askFollowUpQuestions,
+                    };
+                })
+            ),
+            Effect.catchAll(() => Effect.void),
+            Effect.asVoid
+        );
     }
 
     registerListeners(): void {
@@ -52,115 +61,132 @@ export class PersonalityModule extends BaseModule {
             this.brain!.emit(Events.PersonalityResult, {
                 requestId: payload.requestId,
                 systemPrompt,
-                traits: { ...this.traits },
+                traits: this.getTraits(),
             });
         });
 
         this.brain.on(Events.PersonalityAdjust, (event: BrainEvent) => {
             const payload = event.data as PersonalityAdjustPayload;
-            this.adjustTrait(payload.trait, payload.value);
+            this.forkEffect(this.adjustTraitEffect(payload.trait, payload.value));
         });
     }
 
     getTraits(): PersonalityTraits {
+        if (!this.traits) {
+            throw new Error('PersonalityModule not initialized');
+        }
         return { ...this.traits };
     }
 
-    adjustTrait(trait: keyof PersonalityTraits, value: number | boolean): void {
-        if (typeof value === 'number') {
-            // Clamp numeric values to 0-1
-            (this.traits[trait] as number) = Math.max(0, Math.min(1, value));
-        } else {
-            (this.traits[trait] as boolean) = value;
-        }
+    private adjustTraitEffect(
+        trait: keyof PersonalityTraits,
+        value: number | boolean
+    ): Effect.Effect<void, never, AppServices> {
+        return Effect.sync(() => {
+            if (!this.traits) {
+                throw new Error('PersonalityModule not initialized');
+            }
+            if (typeof value === 'number') {
+                (this.traits[trait] as number) = Math.max(0, Math.min(1, value));
+            } else {
+                (this.traits[trait] as boolean) = value;
+            }
+        }).pipe(
+            Effect.flatMap(() =>
+                this.repository.updateTraits('default', { [trait]: value }).pipe(
+                    Effect.catchAll(() => Effect.void)
+                )
+            )
+        );
     }
 
-    adjustTraits(adjustments: Partial<PersonalityTraits>): void {
-        for (const [trait, value] of Object.entries(adjustments)) {
-            this.adjustTrait(trait as keyof PersonalityTraits, value );
-        }
+    async adjustTrait(
+        trait: keyof PersonalityTraits,
+        value: number | boolean
+    ): Promise<void> {
+        await this.runEffect(this.adjustTraitEffect(trait, value));
+    }
+
+    adjustTraitsEffect(
+        adjustments: Partial<PersonalityTraits>
+    ): Effect.Effect<void, never, AppServices> {
+        const entries = Object.entries(adjustments) as Array<[keyof PersonalityTraits, number | boolean]>;
+        return Effect.forEach(
+            entries,
+            ([trait, value]) => this.adjustTraitEffect(trait, value),
+            { discard: true }
+        );
+    }
+
+    async adjustTraits(adjustments: Partial<PersonalityTraits>): Promise<void> {
+        await this.runEffect(this.adjustTraitsEffect(adjustments));
     }
 
     generateSystemPrompt(): string {
+        if (!this.traits) {
+            throw new Error('PersonalityModule not initialized');
+        }
+
         const styleDescriptors: string[] = [];
 
-        // Formality
         if (this.traits.formality < 0.3) {
-            styleDescriptors.push('casual and relaxed');
+            styleDescriptors.push('casual');
         } else if (this.traits.formality > 0.7) {
-            styleDescriptors.push('professional and formal');
-        } else {
-            styleDescriptors.push('balanced in formality');
+            styleDescriptors.push('formal');
         }
 
-        // Warmth
         if (this.traits.warmth > 0.6) {
-            styleDescriptors.push('warm and friendly');
+            styleDescriptors.push('warm');
         }
 
-        // Humor
         if (this.traits.humor > 0.5) {
-            styleDescriptors.push('with a playful sense of humor and wit');
+            styleDescriptors.push('witty');
         }
 
-        // Verbosity
         if (this.traits.verbosity < 0.3) {
-            styleDescriptors.push('brief and concise');
+            styleDescriptors.push('concise');
         } else if (this.traits.verbosity > 0.7) {
-            styleDescriptors.push('thorough and detailed');
+            styleDescriptors.push('thorough');
         }
 
         const guidelines: string[] = [];
 
-        // Confidence
         if (this.traits.confidence > 0.5) {
-            guidelines.push('Be direct and confident in your responses');
+            guidelines.push('Be direct');
         } else {
             guidelines.push('Acknowledge uncertainty when present');
         }
 
-        // Follow-up questions
         if (this.traits.askFollowUpQuestions) {
             guidelines.push('Ask clarifying questions when helpful');
-        } else {
-            guidelines.push('Avoid unnecessary follow-up questions');
         }
 
-        // Emoji
         if (this.traits.useEmoji) {
-            guidelines.push('Use emoji sparingly for emphasis');
+            guidelines.push('Use emoji sparingly');
         } else {
-            guidelines.push('Do not use emoji in responses');
+            guidelines.push('No emoji');
         }
 
-        // Bullet points
         if (this.traits.preferBulletPoints) {
-            guidelines.push('Use bullet points for lists and steps');
+            guidelines.push('Use bullet points for structure');
         }
 
-        // Response length
-        if (this.traits.verbosity < 0.5) {
-            guidelines.push('Keep responses short and to the point');
-        } else {
-            guidelines.push('Provide thorough explanations when needed');
-        }
+        const styleLine =
+            styleDescriptors.length > 0
+                ? `\nStyle: ${styleDescriptors.join(', ')}.`
+                : '';
 
-        return `You are Albert, an AI assistant with persistent memory and knowledge.
+        const guidelinesSection =
+            guidelines.length > 0
+                ? `\n\n${guidelines.map((g) => `- ${g}`).join('\n')}`
+                : '';
 
-Your communication style: ${styleDescriptors.join(', ')}.
-
-Guidelines:
-${guidelines.map(g => `- ${g}`).join('\n')}
-
-Core traits:
-- You remember facts that users tell you
-- You maintain context within conversations
-- You're honest about what you don't know
-- You provide helpful, accurate information`;
+        return `You are Albert.${styleLine}${guidelinesSection}`;
     }
 
     async shutdown(): Promise<void> {
-        // Reset to defaults
-        this.traits = { ...DEFAULT_TRAITS };
+        // Traits are persisted, no cleanup needed
     }
 }
+
+export type { PersonalityTraits, PersonalityProfile };

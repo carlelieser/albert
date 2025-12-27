@@ -18,53 +18,45 @@ describe('TextOutput', () => {
         });
     });
 
-    describe('callback handling', () => {
+    describe('event handling', () => {
         beforeEach(() => {
             output.init(brain);
         });
 
-        it('should call callback with text on OutputReady', () => {
-            const callback = vi.fn();
-            output.setCallback(callback);
+        it('should handle OutputReady event', () => {
+            const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
 
             brain.emit(Events.OutputReady, { text: 'Hello world' });
 
-            expect(callback).toHaveBeenCalledWith('Hello world');
+            expect(consoleSpy).toHaveBeenCalled();
+            consoleSpy.mockRestore();
         });
 
-        it('should handle multiple outputs', () => {
-            const callback = vi.fn();
-            output.setCallback(callback);
+        it('should handle OutputChunk events', () => {
+            const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+            brain.emit(Events.OutputChunk, { text: 'chunk', done: false });
+
+            expect(stdoutSpy).toHaveBeenCalled();
+            stdoutSpy.mockRestore();
+        });
+
+        it('should handle multiple OutputReady events', () => {
+            const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
 
             brain.emit(Events.OutputReady, { text: 'First' });
             brain.emit(Events.OutputReady, { text: 'Second' });
 
-            expect(callback).toHaveBeenCalledTimes(2);
-            expect(callback).toHaveBeenNthCalledWith(1, 'First');
-            expect(callback).toHaveBeenNthCalledWith(2, 'Second');
-        });
-    });
-
-    describe('default behavior', () => {
-        it('should log to console when no callback set', () => {
-            const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-
-            output.init(brain);
-            brain.emit(Events.OutputReady, { text: 'Console output' });
-
-            expect(consoleSpy).toHaveBeenCalled();
+            expect(consoleSpy).toHaveBeenCalledTimes(2);
             consoleSpy.mockRestore();
         });
     });
 
     describe('shutdown', () => {
-        it('should clear callback on shutdown', () => {
-            const callback = vi.fn();
+        it('should clear brain reference on shutdown', () => {
             output.init(brain);
-            output.setCallback(callback);
             output.shutdown();
 
-            // After shutdown, callback should be cleared
             expect(output.getBrain()).toBeNull();
         });
     });

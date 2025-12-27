@@ -1,9 +1,8 @@
-import type { PrismaClient } from '../../generated/prisma/client';
+import { Effect } from 'effect';
 import type { IPersonalityRepository } from '../../domain/repositories/personality.repository';
-import type {
-    PersonalityProfile,
-    PersonalityTraits,
-} from '../../domain/entities/personality';
+import type { PersonalityProfile, PersonalityTraits } from '../../domain/entities/personality';
+import { prismaEffect, type PrismaService } from '../database/prisma.effect';
+import { type DatabaseError, ProfileNotFoundError, TraitUpdateError } from '../../domain/errors';
 
 const DEFAULT_TRAITS: PersonalityTraits = {
     formality: 0.3,
@@ -16,22 +15,30 @@ const DEFAULT_TRAITS: PersonalityTraits = {
     askFollowUpQuestions: true,
 };
 
-export class PrismaPersonalityRepository implements IPersonalityRepository {
-    constructor(private readonly prisma: PrismaClient) {}
-
-    async getProfile(name = 'default'): Promise<PersonalityProfile | null> {
-        const profile = await this.prisma.personalityProfile.findUnique({
-            where: { name },
-        });
-
-        if (!profile) return null;
-
-        return this.mapProfile(profile);
+/**
+ * Prisma-based implementation of the Personality Repository.
+ * All methods return Effects with typed errors.
+ */
+export class PrismaPersonalityRepository implements IPersonalityRepository<PrismaService> {
+    getProfile(
+        name = 'default'
+    ): Effect.Effect<PersonalityProfile, ProfileNotFoundError | DatabaseError, PrismaService> {
+        return prismaEffect('getProfile', (prisma) =>
+            prisma.personalityProfile.findUnique({
+                where: { name },
+            })
+        ).pipe(
+            Effect.flatMap((profile) =>
+                profile
+                    ? Effect.succeed(this.mapProfile(profile))
+                    : Effect.fail(new ProfileNotFoundError({ profileName: name }))
+            )
+        );
     }
 
-    async saveProfile(
+    saveProfile(
         profile: Partial<PersonalityProfile> & { name: string }
-    ): Promise<PersonalityProfile> {
+    ): Effect.Effect<PersonalityProfile, DatabaseError, PrismaService> {
         const data = {
             name: profile.name,
             formality: profile.formality ?? DEFAULT_TRAITS.formality,
@@ -45,41 +52,59 @@ export class PrismaPersonalityRepository implements IPersonalityRepository {
                 profile.askFollowUpQuestions ?? DEFAULT_TRAITS.askFollowUpQuestions,
         };
 
-        const saved = await this.prisma.personalityProfile.upsert({
-            where: { name: profile.name },
-            update: data,
-            create: data,
-        });
-
-        return this.mapProfile(saved);
+        return prismaEffect('saveProfile', (prisma) =>
+            prisma.personalityProfile.upsert({
+                where: { name: profile.name },
+                update: data,
+                create: data,
+            })
+        ).pipe(Effect.map((saved) => this.mapProfile(saved)));
     }
 
-    async updateTraits(
+    updateTraits(
         name: string,
         traits: Partial<PersonalityTraits>
-    ): Promise<PersonalityProfile> {
-        const updated = await this.prisma.personalityProfile.update({
-            where: { name },
-            data: traits,
-        });
-
-        return this.mapProfile(updated);
+    ): Effect.Effect<
+        PersonalityProfile,
+        ProfileNotFoundError | TraitUpdateError | DatabaseError,
+        PrismaService
+    > {
+        return prismaEffect('updateTraits', (prisma) =>
+            prisma.personalityProfile.update({
+                where: { name },
+                data: traits,
+            })
+        ).pipe(
+            Effect.map((updated) => this.mapProfile(updated)),
+            Effect.mapError((error) =>
+                error._tag === 'DatabaseError' && error.message.includes('Record to update not found')
+                    ? new ProfileNotFoundError({ profileName: name })
+                    : new TraitUpdateError({
+                          trait: Object.keys(traits).join(', '),
+                          value: traits,
+                          message: error.message,
+                          cause: error.cause,
+                      })
+            )
+        );
     }
 
-    async getOrCreateDefault(): Promise<PersonalityProfile> {
-        const existing = await this.prisma.personalityProfile.findUnique({
-            where: { name: 'default' },
-        });
-
-        if (existing) {
-            return this.mapProfile(existing);
-        }
-
-        const created = await this.prisma.personalityProfile.create({
-            data: { name: 'default', ...DEFAULT_TRAITS },
-        });
-
-        return this.mapProfile(created);
+    getOrCreateDefault(): Effect.Effect<PersonalityProfile, DatabaseError, PrismaService> {
+        return prismaEffect('getOrCreateDefault', (prisma) =>
+            prisma.personalityProfile.findUnique({
+                where: { name: 'default' },
+            })
+        ).pipe(
+            Effect.flatMap((existing) =>
+                existing
+                    ? Effect.succeed(this.mapProfile(existing))
+                    : prismaEffect('createDefault', (prisma) =>
+                          prisma.personalityProfile.create({
+                              data: { name: 'default', ...DEFAULT_TRAITS },
+                          })
+                      ).pipe(Effect.map((created) => this.mapProfile(created)))
+            )
+        );
     }
 
     private mapProfile(profile: {

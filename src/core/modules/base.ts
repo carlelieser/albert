@@ -1,13 +1,12 @@
-import type { Ollama } from 'ollama';
+import { Effect } from 'effect';
 import type { Brain } from '../brain';
+import type { AppServices } from '../../infrastructure/layers';
 
 export abstract class BaseModule {
     protected brain: Brain | null = null;
-    protected ollama: Ollama;
     protected readonly name: string;
 
-    constructor(ollama: Ollama, name: string) {
-        this.ollama = ollama;
+    constructor(name: string) {
         this.name = name;
     }
 
@@ -16,15 +15,25 @@ export abstract class BaseModule {
         this.registerListeners();
     }
 
+    protected runEffect<A, E>(effect: Effect.Effect<A, E, AppServices>): Promise<A> {
+        if (!this.brain) {
+            throw new Error(`Module "${this.name}" not initialized. Call init() first.`);
+        }
+        return this.brain.runEffect(effect);
+    }
+
+    protected forkEffect<A, E>(effect: Effect.Effect<A, E, AppServices>): void {
+        if (!this.brain) {
+            throw new Error(`Module "${this.name}" not initialized. Call init() first.`);
+        }
+        this.brain.forkEffect(effect);
+    }
+
     abstract registerListeners(): void;
     abstract shutdown(): void | Promise<void>;
 
     getName(): string {
         return this.name;
-    }
-
-    getOllama(): Ollama {
-        return this.ollama;
     }
 
     getBrain(): Brain | null {

@@ -1,19 +1,47 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { Effect } from 'effect';
 import { PersonalityModule } from '../../../src/core/modules/personality';
 import { Brain } from '../../../src/core/brain';
 import { Events } from '../../../src/core/events';
-import type { Ollama } from 'ollama';
+import type { IPersonalityRepository } from '../../../src/domain/repositories/personality.repository';
+import type { PersonalityProfile } from '../../../src/domain/entities/personality';
+import type { PrismaService } from '../../../src/infrastructure/database/prisma.effect';
+import { createTestRuntime } from '../../helpers/test-runtime';
+
+function createMockPersonalityRepository(): IPersonalityRepository<PrismaService> {
+    const defaultProfile: PersonalityProfile = {
+        id: 'default',
+        name: 'default',
+        formality: 0.4,
+        verbosity: 0.4,
+        warmth: 0.7,
+        humor: 0.3,
+        confidence: 0.6,
+        useEmoji: false,
+        preferBulletPoints: true,
+        askFollowUpQuestions: true,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+    };
+
+    return {
+        getProfile: vi.fn().mockReturnValue(Effect.succeed(defaultProfile)),
+        saveProfile: vi.fn().mockReturnValue(Effect.succeed(defaultProfile)),
+        updateTraits: vi.fn().mockReturnValue(Effect.succeed(defaultProfile)),
+        getOrCreateDefault: vi.fn().mockReturnValue(Effect.succeed(defaultProfile)),
+    };
+}
 
 describe('PersonalityModule', () => {
     let module: PersonalityModule;
     let brain: Brain;
-    let mockOllama: Ollama;
+    let mockRepository: IPersonalityRepository<PrismaService>;
 
     beforeEach(() => {
-        // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
-        mockOllama = {} as Ollama;
         brain = new Brain();
-        module = new PersonalityModule(mockOllama);
+        brain.setRuntime(createTestRuntime());
+        mockRepository = createMockPersonalityRepository();
+        module = new PersonalityModule(mockRepository);
     });
 
     describe('initialization', () => {
@@ -21,8 +49,8 @@ describe('PersonalityModule', () => {
             expect(module.getName()).toBe('personality');
         });
 
-        it('should have default traits', () => {
-            module.init(brain);
+        it('should have default traits', async () => {
+            await module.init(brain);
             const traits = module.getTraits();
 
             expect(traits.formality).toBeDefined();
@@ -34,8 +62,8 @@ describe('PersonalityModule', () => {
     });
 
     describe('event handling', () => {
-        beforeEach(() => {
-            module.init(brain);
+        beforeEach(async () => {
+            await module.init(brain);
         });
 
         it('should emit PersonalityResult on PersonalityQuery', () => {
@@ -68,30 +96,30 @@ describe('PersonalityModule', () => {
     });
 
     describe('traits', () => {
-        beforeEach(() => {
-            module.init(brain);
+        beforeEach(async () => {
+            await module.init(brain);
         });
 
-        it('should adjust a numeric trait', () => {
-            module.adjustTrait('formality', 0.8);
+        it('should adjust a numeric trait', async () => {
+            await module.adjustTrait('formality', 0.8);
             expect(module.getTraits().formality).toBe(0.8);
         });
 
-        it('should adjust a boolean trait', () => {
-            module.adjustTrait('useEmoji', true);
+        it('should adjust a boolean trait', async () => {
+            await module.adjustTrait('useEmoji', true);
             expect(module.getTraits().useEmoji).toBe(true);
         });
 
-        it('should clamp numeric traits to 0-1 range', () => {
-            module.adjustTrait('formality', 1.5);
+        it('should clamp numeric traits to 0-1 range', async () => {
+            await module.adjustTrait('formality', 1.5);
             expect(module.getTraits().formality).toBe(1);
 
-            module.adjustTrait('formality', -0.5);
+            await module.adjustTrait('formality', -0.5);
             expect(module.getTraits().formality).toBe(0);
         });
 
-        it('should adjust multiple traits at once', () => {
-            module.adjustTraits({
+        it('should adjust multiple traits at once', async () => {
+            await module.adjustTraits({
                 formality: 0.8,
                 humor: 0.9,
                 useEmoji: true,
@@ -105,8 +133,8 @@ describe('PersonalityModule', () => {
     });
 
     describe('system prompt generation', () => {
-        beforeEach(() => {
-            module.init(brain);
+        beforeEach(async () => {
+            await module.init(brain);
         });
 
         it('should generate a system prompt', () => {
@@ -117,36 +145,36 @@ describe('PersonalityModule', () => {
             expect(prompt.length).toBeGreaterThan(50);
         });
 
-        it('should reflect formal style when formality is high', () => {
-            module.adjustTrait('formality', 0.9);
+        it('should reflect formal style when formality is high', async () => {
+            await module.adjustTrait('formality', 0.9);
             const prompt = module.generateSystemPrompt();
 
             expect(prompt.toLowerCase()).toContain('formal');
         });
 
-        it('should reflect casual style when formality is low', () => {
-            module.adjustTrait('formality', 0.1);
+        it('should reflect casual style when formality is low', async () => {
+            await module.adjustTrait('formality', 0.1);
             const prompt = module.generateSystemPrompt();
 
             expect(prompt.toLowerCase()).toContain('casual');
         });
 
-        it('should mention brevity when verbosity is low', () => {
-            module.adjustTrait('verbosity', 0.1);
+        it('should mention brevity when verbosity is low', async () => {
+            await module.adjustTrait('verbosity', 0.1);
             const prompt = module.generateSystemPrompt();
 
             expect(prompt.toLowerCase()).toMatch(/brief|concise|short/);
         });
 
-        it('should mention warmth when warmth is high', () => {
-            module.adjustTrait('warmth', 0.9);
+        it('should mention warmth when warmth is high', async () => {
+            await module.adjustTrait('warmth', 0.9);
             const prompt = module.generateSystemPrompt();
 
             expect(prompt.toLowerCase()).toMatch(/warm|friendly/);
         });
 
-        it('should mention humor when humor is high', () => {
-            module.adjustTrait('humor', 0.8);
+        it('should mention humor when humor is high', async () => {
+            await module.adjustTrait('humor', 0.8);
             const prompt = module.generateSystemPrompt();
 
             expect(prompt.toLowerCase()).toMatch(/humor|playful|wit/);
@@ -154,8 +182,8 @@ describe('PersonalityModule', () => {
     });
 
     describe('default traits', () => {
-        it('should have sensible defaults', () => {
-            module.init(brain);
+        it('should have sensible defaults', async () => {
+            await module.init(brain);
             const traits = module.getTraits();
 
             // Should lean casual but not too casual
@@ -175,7 +203,7 @@ describe('PersonalityModule', () => {
 
     describe('shutdown', () => {
         it('should not throw on shutdown', async () => {
-            module.init(brain);
+            await module.init(brain);
             await expect(module.shutdown()).resolves.not.toThrow();
         });
     });

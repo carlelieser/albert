@@ -1,0 +1,27 @@
+{
+  "include": [
+    "src/**/*",
+    "test/**/*"
+  ],
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "./bin",
+    "strict": true,
+    "target": "ES6",
+    "module": "CommonJS",
+    "sourceMap": true,
+    "esModuleInterop": true,
+    "moduleResolution": "node",
+    "allowSyntheticDefaultImports": true,
+    "jsx": "react",
+    "types": [
+      "vitest/globals"
+    ],
+    "emitDeclarationOnly": false,
+    "incremental": true,
+    "tsBuildInfoFile": "/Users/devplex/WebstormProjects/albert/node_modules/vitest/dist/tsconfig.tmp.tsbuildinfo"
+  },
+  "exclude": [
+    "bin"
+  ]
+}

@@ -8,7 +8,7 @@ let prisma: PrismaClient | null = null;
 
 // Resolve the database path - handle relative file: URLs
 function resolveDatabaseUrl(): string {
-    const url = process.env.DATABASE_URL || 'file:./albert.db';
+    const url = process.env.DATABASE_URL ?? 'file:./albert.db';
     if (url.startsWith('file:./')) {
         return `file:${path.join(process.cwd(), url.slice(7))}`;
     }
@@ -30,10 +30,7 @@ export function getPrismaClient(): PrismaClient {
 
         prisma = new PrismaClient({
             adapter,
-            log:
-                process.env.NODE_ENV === 'development'
-                    ? ['query', 'error', 'warn']
-                    : ['error'],
+            log: process.env.PRISMA_LOG === 'true' ? ['query', 'error', 'warn'] : [],
         });
     }
     return prisma;

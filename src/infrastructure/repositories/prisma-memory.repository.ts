@@ -1,37 +1,189 @@
-import type { PrismaClient } from '../../generated/prisma/client';
+import { Effect } from 'effect';
 import type { IMemoryRepository } from '../../domain/repositories/memory.repository';
 import type { MemoryEntry, Session } from '../../domain/entities/memory';
+import { prismaEffect, prismaTransaction, type PrismaService } from '../database/prisma.effect';
+import {
+    type DatabaseError,
+    SessionNotFoundError,
+    NoActiveSessionError,
+    SessionCreationError,
+    MemoryEntryError,
+} from '../../domain/errors';
 
-export class PrismaMemoryRepository implements IMemoryRepository {
-    constructor(private readonly prisma: PrismaClient) {}
+/**
+ * Prisma-based implementation of the Memory Repository.
+ * All methods return Effects with typed errors.
+ */
+export class PrismaMemoryRepository implements IMemoryRepository<PrismaService> {
+    createSession(
+        name?: string
+    ): Effect.Effect<Session, SessionCreationError | DatabaseError, PrismaService> {
+        return prismaTransaction('createSession', async (tx) => {
+            // Deactivate all existing active sessions
+            await tx.session.updateMany({
+                where: { isActive: true },
+                data: { isActive: false },
+            });
 
-    async createSession(name?: string): Promise<Session> {
-        await this.prisma.session.updateMany({
-            where: { isActive: true },
-            data: { isActive: false },
-        });
+            // Create new active session
+            const session = await tx.session.create({
+                data: { name, isActive: true },
+            });
 
-        const session = await this.prisma.session.create({
-            data: { name, isActive: true },
-        });
-
-        return {
-            id: session.id,
-            name: session.name,
-            createdAt: session.createdAt,
-            updatedAt: session.updatedAt,
-            isActive: session.isActive,
-        };
+            return {
+                id: session.id,
+                name: session.name,
+                createdAt: session.createdAt,
+                updatedAt: session.updatedAt,
+                isActive: session.isActive,
+            };
+        }).pipe(
+            Effect.mapError((error) =>
+                error._tag === 'DatabaseError'
+                    ? new SessionCreationError({
+                          message: error.message,
+                          cause: error.cause,
+                      })
+                    : error
+            )
+        );
     }
 
-    async getSession(id: string): Promise<Session | null> {
-        const session = await this.prisma.session.findUnique({
-            where: { id },
-            include: { entries: { orderBy: { timestamp: 'asc' } } },
-        });
+    getSession(
+        id: string
+    ): Effect.Effect<Session, SessionNotFoundError | DatabaseError, PrismaService> {
+        return prismaEffect('getSession', (prisma) =>
+            prisma.session.findUnique({
+                where: { id },
+                include: { entries: { orderBy: { timestamp: 'asc' } } },
+            })
+        ).pipe(
+            Effect.flatMap((session) =>
+                session
+                    ? Effect.succeed(this.mapSession(session))
+                    : Effect.fail(new SessionNotFoundError({ sessionId: id }))
+            )
+        );
+    }
 
-        if (!session) return null;
+    getActiveSession(): Effect.Effect<
+        Session,
+        NoActiveSessionError | DatabaseError,
+        PrismaService
+    > {
+        return prismaEffect('getActiveSession', (prisma) =>
+            prisma.session.findFirst({
+                where: { isActive: true },
+                include: { entries: { orderBy: { timestamp: 'asc' } } },
+            })
+        ).pipe(
+            Effect.flatMap((session) =>
+                session
+                    ? Effect.succeed(this.mapSession(session))
+                    : Effect.fail(new NoActiveSessionError())
+            )
+        );
+    }
 
+    closeSession(
+        id: string
+    ): Effect.Effect<void, SessionNotFoundError | DatabaseError, PrismaService> {
+        return prismaEffect('closeSession', (prisma) =>
+            prisma.session.update({
+                where: { id },
+                data: { isActive: false },
+            })
+        ).pipe(
+            Effect.asVoid,
+            Effect.mapError((error) =>
+                error._tag === 'DatabaseError' && error.message.includes('Record to update not found')
+                    ? new SessionNotFoundError({ sessionId: id })
+                    : error
+            )
+        );
+    }
+
+    closeAllSessions(): Effect.Effect<void, DatabaseError, PrismaService> {
+        return prismaEffect('closeAllSessions', (prisma) =>
+            prisma.session.updateMany({
+                where: { isActive: true },
+                data: { isActive: false },
+            })
+        ).pipe(Effect.asVoid);
+    }
+
+    addEntry(
+        entry: Omit<MemoryEntry, 'id'>
+    ): Effect.Effect<MemoryEntry, MemoryEntryError | DatabaseError, PrismaService> {
+        return prismaEffect('addEntry', (prisma) =>
+            prisma.memoryEntry.create({
+                data: {
+                    sessionId: entry.sessionId,
+                    role: entry.role,
+                    content: entry.content,
+                    metadata: entry.metadata ? JSON.stringify(entry.metadata) : null,
+                    timestamp: entry.timestamp || new Date(),
+                },
+            })
+        ).pipe(
+            Effect.map((created) => this.mapEntry(created)),
+            Effect.mapError((error) =>
+                error._tag === 'DatabaseError'
+                    ? new MemoryEntryError({
+                          operation: 'add',
+                          message: error.message,
+                          cause: error.cause,
+                      })
+                    : error
+            )
+        );
+    }
+
+    getRecentEntries(
+        sessionId: string,
+        limit = 20
+    ): Effect.Effect<MemoryEntry[], DatabaseError, PrismaService> {
+        return prismaEffect('getRecentEntries', (prisma) =>
+            prisma.memoryEntry.findMany({
+                where: { sessionId },
+                orderBy: { timestamp: 'desc' },
+                take: limit,
+            })
+        ).pipe(Effect.map((entries) => entries.reverse().map((e) => this.mapEntry(e))));
+    }
+
+    getAllEntries(sessionId: string): Effect.Effect<MemoryEntry[], DatabaseError, PrismaService> {
+        return prismaEffect('getAllEntries', (prisma) =>
+            prisma.memoryEntry.findMany({
+                where: { sessionId },
+                orderBy: { timestamp: 'asc' },
+            })
+        ).pipe(Effect.map((entries) => entries.map((e) => this.mapEntry(e))));
+    }
+
+    clearSession(sessionId: string): Effect.Effect<void, DatabaseError, PrismaService> {
+        return prismaEffect('clearSession', (prisma) =>
+            prisma.memoryEntry.deleteMany({
+                where: { sessionId },
+            })
+        ).pipe(Effect.asVoid);
+    }
+
+    private mapSession(session: {
+        id: string;
+        name: string | null;
+        createdAt: Date;
+        updatedAt: Date;
+        isActive: boolean;
+        entries: Array<{
+            id: number;
+            sessionId: string;
+            role: string;
+            content: string;
+            metadata: string | null;
+            timestamp: Date;
+        }>;
+    }): Session {
         return {
             id: session.id,
             name: session.name,
@@ -40,77 +192,6 @@ export class PrismaMemoryRepository implements IMemoryRepository {
             isActive: session.isActive,
             entries: session.entries.map((e) => this.mapEntry(e)),
         };
-    }
-
-    async getActiveSession(): Promise<Session | null> {
-        const session = await this.prisma.session.findFirst({
-            where: { isActive: true },
-            include: { entries: { orderBy: { timestamp: 'asc' } } },
-        });
-
-        if (!session) return null;
-
-        return {
-            id: session.id,
-            name: session.name,
-            createdAt: session.createdAt,
-            updatedAt: session.updatedAt,
-            isActive: session.isActive,
-            entries: session.entries.map((e) => this.mapEntry(e)),
-        };
-    }
-
-    async closeSession(id: string): Promise<void> {
-        await this.prisma.session.update({
-            where: { id },
-            data: { isActive: false },
-        });
-    }
-
-    async closeAllSessions(): Promise<void> {
-        await this.prisma.session.updateMany({
-            where: { isActive: true },
-            data: { isActive: false },
-        });
-    }
-
-    async addEntry(entry: Omit<MemoryEntry, 'id'>): Promise<MemoryEntry> {
-        const created = await this.prisma.memoryEntry.create({
-            data: {
-                sessionId: entry.sessionId,
-                role: entry.role,
-                content: entry.content,
-                metadata: entry.metadata ? JSON.stringify(entry.metadata) : null,
-                timestamp: entry.timestamp || new Date(),
-            },
-        });
-
-        return this.mapEntry(created);
-    }
-
-    async getRecentEntries(sessionId: string, limit = 20): Promise<MemoryEntry[]> {
-        const entries = await this.prisma.memoryEntry.findMany({
-            where: { sessionId },
-            orderBy: { timestamp: 'desc' },
-            take: limit,
-        });
-
-        return entries.reverse().map((e) => this.mapEntry(e));
-    }
-
-    async getAllEntries(sessionId: string): Promise<MemoryEntry[]> {
-        const entries = await this.prisma.memoryEntry.findMany({
-            where: { sessionId },
-            orderBy: { timestamp: 'asc' },
-        });
-
-        return entries.map((e) => this.mapEntry(e));
-    }
-
-    async clearSession(sessionId: string): Promise<void> {
-        await this.prisma.memoryEntry.deleteMany({
-            where: { sessionId },
-        });
     }
 
     private mapEntry(e: {

@@ -1,5 +1,8 @@
 import { EventEmitter } from 'node:events';
+import { Effect } from 'effect';
 import { Events, type EventType } from './events';
+import type { RuntimeBridge } from '../infrastructure/runtime';
+import type { AppServices } from '../infrastructure/layers';
 
 export interface BrainEvent {
     timestamp: number;
@@ -30,6 +33,26 @@ export class Brain extends EventEmitter {
     private readonly inputs = new Map<string, Input>();
     private readonly outputs = new Map<string, Output>();
     private active: boolean = false;
+    private runtime: RuntimeBridge<AppServices> | null = null;
+
+    setRuntime(runtime: RuntimeBridge<AppServices>): void {
+        this.runtime = runtime;
+    }
+
+    getRuntime(): RuntimeBridge<AppServices> {
+        if (!this.runtime) {
+            throw new Error('Brain runtime not initialized. Call setRuntime() first.');
+        }
+        return this.runtime;
+    }
+
+    runEffect<A, E>(effect: Effect.Effect<A, E, AppServices>): Promise<A> {
+        return this.getRuntime().runPromise(effect);
+    }
+
+    forkEffect<A, E>(effect: Effect.Effect<A, E, AppServices>): void {
+        this.getRuntime().runFork(effect);
+    }
 
     emit(event: EventType, data?: unknown): boolean {
         const brainEvent: BrainEvent = {
