@@ -1,0 +1,85 @@
+// Prisma schema for Albert AI Assistant
+// Migrated from better-sqlite3 to Prisma ORM
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+// ============================================
+// KNOWLEDGE DOMAIN
+// ============================================
+
+model KnowledgeFact {
+  id         Int        @id @default(autoincrement())
+  fact       String     @unique
+  source     String?
+  confidence Float      @default(1.0)
+  embedding  Bytes?
+  createdAt  DateTime   @default(now())
+  updatedAt  DateTime   @updatedAt
+  categories Category[] @relation("KnowledgeCategories")
+
+  @@map("knowledge")
+}
+
+model Category {
+  id    Int             @id @default(autoincrement())
+  name  String          @unique
+  facts KnowledgeFact[] @relation("KnowledgeCategories")
+
+  @@map("categories")
+}
+
+// ============================================
+// MEMORY DOMAIN
+// ============================================
+
+model Session {
+  id        String        @id @default(uuid())
+  name      String?
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+  isActive  Boolean       @default(true)
+  entries   MemoryEntry[]
+
+  @@map("sessions")
+}
+
+model MemoryEntry {
+  id        Int      @id @default(autoincrement())
+  sessionId String
+  role      String
+  content   String
+  metadata  String?
+  timestamp DateTime @default(now())
+  session   Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, timestamp])
+  @@map("memory_entries")
+}
+
+// ============================================
+// PERSONALITY DOMAIN
+// ============================================
+
+model PersonalityProfile {
+  id                   String   @id @default(uuid())
+  name                 String   @unique @default("default")
+  formality            Float    @default(0.3)
+  verbosity            Float    @default(0.4)
+  warmth               Float    @default(0.7)
+  humor                Float    @default(0.3)
+  confidence           Float    @default(0.6)
+  useEmoji             Boolean  @default(false)
+  preferBulletPoints   Boolean  @default(false)
+  askFollowUpQuestions Boolean  @default(true)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  @@map("personality_profiles")
+}
